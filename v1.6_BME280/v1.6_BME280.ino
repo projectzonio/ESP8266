@@ -3,6 +3,7 @@
 // Zonio Wemos D1 Mini + BME280 Meteostanice
 // Verze: 1.6.1 - Upraveno pro Wemos D1 mini bez displeje
 // Založeno na ESP32-C3 firmware v1.6.0
+//Warning - burst publish in long interval may be cause problems with graphs. If problem - disable it or edit your mqtt API to filter burst messages from v1.6.x type FW. 
 
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
@@ -758,3 +759,4 @@ void loop() {
   delay(10);
 }
 //-----------06-----------
+
