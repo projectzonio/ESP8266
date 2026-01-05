@@ -4,6 +4,7 @@
 // Verze: 1.6.1 - Upraveno pro Wemos D1 mini bez displeje
 // Založeno na ESP32-C3 firmware v1.6.0
 //Warning - burst publish in long interval may be cause problems with graphs. If problem - disable it or edit your mqtt API to filter burst messages from v1.6.x type FW. 
+//XOR support added
 
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
@@ -29,6 +30,11 @@ const char* TOPIC_SYSTEM  = "zonio/system/status/sensor1";   // Systémový stat
 
 // Další nastavení
 const char* FIRMWARE_VERSION = "v1.6.1-WemosD1-BME280";
+
+
+// XOR Encryption Key - MUST MATCH BACKEND!
+// Key is used for E2E payload obfuscation
+const char* XOR_KEY = "your_key_24_character";
 
 // Časové intervaly (ms)
 const unsigned long STATUS_INTERVAL   = 60000;   // Interval odesílání systémového statusu (60 s)
@@ -568,7 +574,16 @@ void readSensors() {
 
 //-----------05-----------
 
-// Publikování naměřených dat na MQTT
+// XOR encrypt/decrypt payload IN-PLACE (symmetric operation)
+// Works directly on buffer to avoid RAM fragmentation
+void xorPayload(char* buffer, int len) {
+  int keyLen = strlen(XOR_KEY);
+  for (int i = 0; i < len; i++) {
+    buffer[i] = buffer[i] ^ XOR_KEY[i % keyLen];
+  }
+}
+
+// Publikování naměřených dat na MQTT (ENCRYPTED)
 void publishSensorData(int repeatCount = 1) {
   if (!mqttConnected) return;
   
@@ -577,20 +592,29 @@ void publishSensorData(int repeatCount = 1) {
   
   char payload[150];
   for (int i = 0; i < repeatCount; i++) {
-    // Přidáváme číslo opakování pro rozlišení na dashboardu
-    snprintf(payload, sizeof(payload),
+    // 1. Build plaintext JSON
+    int payloadLen = snprintf(payload, sizeof(payload),
              "{\"temp\":%.1f,\"hum\":%.0f,\"pres\":%.0f,\"repeat\":%d}",
              sensorData.temperature,
              sensorData.humidity,
              sensorData.pressure,
              i);
     
-    mqttClient.publish(TOPIC_WEATHER, payload);
-    Serial.print("Data odeslána (opakování ");
-    Serial.print(i+1);
-    Serial.print("/");
-    Serial.print(repeatCount);
-    Serial.println(")");
+    // 2. XOR encrypt IN-PLACE
+    xorPayload(payload, payloadLen);
+    
+    // 3. Publish as BINARY data (not string!)
+    // Critical: use (uint8_t*) cast and length parameter
+    // because XOR can produce 0x00 bytes that would terminate string early
+    bool published = mqttClient.publish(TOPIC_WEATHER, (uint8_t*)payload, payloadLen);
+    
+    if (published) {
+      Serial.print("Data odeslána (XOR encrypted, opakování ");
+      Serial.print(i+1);
+      Serial.print("/");
+      Serial.print(repeatCount);
+      Serial.println(")");
+    }
     
     if (i < repeatCount - 1) {
       delay(500);  // Krátká pauza mezi opakovanými odesláními
