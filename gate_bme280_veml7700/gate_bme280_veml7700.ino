@@ -75,7 +75,7 @@
 // ===== CONFIG GATE SETTINGS =====
 #define ENABLE_VEML_AUTORANGE   1      // Enable VEML Autorange features
 #define GATE_AP_SSID            "Zonio-Gate"
-#define GATE_AP_PASS            "zonio_gate_pass"
+#define GATE_AP_PASS            "12345678"
 #define CONFIG_VALID_FLAG       0xC6A7
 #define EEPROM_SIZE             512
 
@@ -902,25 +902,25 @@ void loopNormalMode() {
        lastOfflineBlink = now;
        digitalWrite(LED_PIN, !digitalRead(LED_PIN)); 
     }
-    return;
+    return; // CRITICAL: Exit here - WiFi is not connected, skip MQTT logic
   } 
   
   // ==========================================================
-  // 2. CONNECTED STATE MAINTENANCE
+  // 2. WiFi CONNECTED - RESET DISCONNECT STATE
   // ==========================================================
-  if (WiFi.status() == WL_CONNECTED) {
-    // Reset disconnect info if we just reconnected
-    if (disconnectStartTime != 0) {
-       Serial.println("[WiFi] Reconnected!");
-       disconnectStartTime = 0;
-       wifiReconnectAttempts = 0;
-       mqttReconnectInterval = RECONNECT_BASE; // Fast retry for MQTT
-       wasEverConnected = true;
-       digitalWrite(LED_PIN, HIGH); // Ensure LED is off (active low logic usually, but here HIGH=OFF based on setup)
-    }
+  // Reset disconnect info if we just reconnected
+  if (disconnectStartTime != 0) {
+     Serial.println("[WiFi] Reconnected!");
+     disconnectStartTime = 0;
+     wifiReconnectAttempts = 0;
+     mqttReconnectInterval = RECONNECT_BASE; // Fast retry for MQTT
+     wasEverConnected = true;
+     digitalWrite(LED_PIN, HIGH); // Ensure LED is off (active low logic usually, but here HIGH=OFF based on setup)
   }
   
-  // MQTT connection management with exponential backoff
+  // ==========================================================
+  // 3. MQTT CONNECTION MANAGEMENT (WiFi is connected)
+  // ==========================================================
   if (!mqttClient.connected()) {
     if (now - lastMQTTReconnectAttempt > mqttReconnectInterval) {
       lastMQTTReconnectAttempt = now;
@@ -957,6 +957,9 @@ void loopNormalMode() {
     mqttClient.loop();
   }
   
+  // ==========================================================
+  // 4. SENSOR READING & PUBLISHING (WiFi connected)
+  // ==========================================================
   // Sensor reading
   if (now - lastSensorRead >= INT_FAST) {
     lastSensorRead = now;
@@ -974,6 +977,9 @@ void loopNormalMode() {
     }
   }
   
+  // ==========================================================
+  // 5. STATUS LED (WiFi connected)
+  // ==========================================================
   // Fast heartbeat blink
   static unsigned long lastBlink = 0;
   if (now - lastBlink > 100) {
