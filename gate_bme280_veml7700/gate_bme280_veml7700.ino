@@ -1,8 +1,9 @@
 // @ZONIO_ID:ZONIO-ESP8266-GATE
 // Zonio ESP8266 D1 Mini VEML7700 Light Sensor with Config Gate Integration
-// Version: 4.0.0-GATE
+// Version: 4.1.3-GATE
 // Hardware: ESP8266 D1 Mini + VEML7700
 // Config: Via Zonio Config Gate
+// XOR obfuscation
 
 //------------01-----------
 // BLOCK 01: INCLUDES & COMPATIBILITY LAYER
@@ -64,13 +65,17 @@
 
 
 // ===== FIRMWARE VERSION =====
-#define FW_VERSION              "v4.1.0-GATE-ADV"
+#define FW_VERSION              "v4.1.2-GATE-XOR"
 #define DEVICE_TYPE             "BME280_veml7700_combi_sensor"
+
+// ===== XOR ENCRYPTION KEY =====
+// Key is used for E2E payload obfuscation - Now configurable via Config Gate
+// Default: "MojeTajneHeslo1234567890"
 
 // ===== CONFIG GATE SETTINGS =====
 #define ENABLE_VEML_AUTORANGE   1      // Enable VEML Autorange features
 #define GATE_AP_SSID            "Zonio-Gate"
-#define GATE_AP_PASS            "12345678"
+#define GATE_AP_PASS            "zonio_gate_pass"
 #define CONFIG_VALID_FLAG       0xC6A7
 #define EEPROM_SIZE             512
 
@@ -143,6 +148,7 @@ struct DeviceConfig {
   char mqtt_user[32];
   char mqtt_pass[32];
   char mqtt_base_topic[64];              // e.g., "zonio/weather/DP1"
+  char xor_key[32];                      // Encryption key
   bool veml_autorange;                   // Enable/disable VEML autorange (default: false)
   uint32_t checksum;
 };
@@ -168,7 +174,7 @@ struct VemlRangeStep {
 //------------03-----------
 
 //------------04-----------
-// BLOCK 04: GLOBAL VARIABLES
+//BLOCK 04: GLOBAL VARIABLES
 
 // ===== CONFIGURATION =====
 DeviceConfig deviceConfig;
@@ -219,9 +225,7 @@ char chipId[16] = "";
 
 
 //------------05-----------
-// ============================================================================
-// FORWARD DECLARATIONS (Required for Arduino IDE)
-// ============================================================================
+//BLOCK 05: FORWARD DECLARATIONS (Required for Arduino IDE)
 
 uint32_t calculateChecksum(const DeviceConfig& cfg);
 bool loadConfig();
@@ -238,9 +242,19 @@ void loopNormalMode();
 bool initSensors();
 void readSensors();
 
-// ============================================================================
-// BLOCK 05: CONFIGURATION MANAGEMENT (EEPROM)
-// ============================================================================
+// XOR encrypt/decrypt payload IN-PLACE (symmetric operation)
+// Works directly on buffer to avoid RAM fragmentation
+void xorPayload(char* buffer, int len) {
+  int keyLen = strlen(deviceConfig.xor_key);
+  if (keyLen == 0) return; // No encryption if key is empty
+  
+  for (int i = 0; i < len; i++) {
+    buffer[i] = buffer[i] ^ deviceConfig.xor_key[i % keyLen];
+  }
+}
+
+
+// CONFIGURATION MANAGEMENT (EEPROM)
 
 uint32_t calculateChecksum(const DeviceConfig& cfg) {
   uint32_t sum = 0;
@@ -557,6 +571,12 @@ void handleSchema() {
   veml["autorange"]["type"] = "boolean";
   veml["autorange"]["label"] = "VEML Autorange";
   veml["autorange"]["default"] = false;  // Default: disabled
+
+  // Security settings
+  JsonObject security = config["security"].to<JsonObject>();
+  security["xor_key"]["type"] = "text";
+  security["xor_key"]["label"] = "XOR Key";
+  security["xor_key"]["default"] = "MojeTajneHeslo1234567890";
   
   String out;
   serializeJson(doc, out);
@@ -612,6 +632,13 @@ void handleConfig() {
   if (doc["veml"].is<JsonObject>()) {
     deviceConfig.veml_autorange = doc["veml"]["autorange"] | false;  // Default: disabled
   }
+
+  // Parse Security settings
+  if (doc["security"].is<JsonObject>()) {
+    strlcpy(deviceConfig.xor_key, 
+            doc["security"]["xor_key"] | "", 
+            sizeof(deviceConfig.xor_key));
+  }
   
   Serial.println("[GATE] Config received:");
   Serial.print("  WiFi: ");
@@ -620,6 +647,8 @@ void handleConfig() {
   Serial.print(deviceConfig.mqtt_server);
   Serial.print(":");
   Serial.println(deviceConfig.mqtt_port);
+  Serial.print("  XOR Key: ");
+  Serial.println(strlen(deviceConfig.xor_key) > 0 ? "SET" : "EMPTY");
   
   if (saveConfig()) {
     configServer.send(200, "application/json", "{\"status\":\"saved\"}");
@@ -712,14 +741,25 @@ void publishWeatherData() {
   if (!mqttClient.connected()) return;
   
   char msg[256];
-  snprintf(msg, sizeof(msg), 
+  int payloadLen = snprintf(msg, sizeof(msg), 
            "{\"%s\":%.1f,\"%s\":%.1f,\"%s\":%d,\"%s\":%.1f}", 
            KEY_TEMP, currentSensorData.temperature,
            KEY_HUM, currentSensorData.humidity,
            KEY_PRES, (int)currentSensorData.pressure,
            KEY_LUX, currentSensorData.lux);
+
+  // XOR encrypt IN-PLACE
+  xorPayload(msg, payloadLen);
   
-  mqttClient.publish(deviceConfig.mqtt_base_topic, msg);
+  // Publish as BINARY data
+  // Use (uint8_t*) cast and length parameter because XOR can produce 0x00 bytes
+  bool published = mqttClient.publish(deviceConfig.mqtt_base_topic, (uint8_t*)msg, payloadLen);
+
+  if (published) {
+    Serial.println("[MQTT] Weather data published (XOR encrypted)");
+  } else {
+    Serial.println("[MQTT] Publish failed");
+  }
 }
 
 void publishSystemStatus() {
