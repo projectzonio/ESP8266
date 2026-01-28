@@ -1,6 +1,6 @@
 // @ZONIO_ID:ZONIO-ESP8266-121
 // Zonio ESP8266 D1 Mini Meteostanice - No Display Version
-// Verze: 2.3.0 - ESP8266 D1 Mini adaptation + GPT improvements + VEML Autorange
+// Verze: 2.4.1 - MQTT reconnect improved, XOR MQTT obfuscation, read carefully blocks 01 and 02
 //------------01----------- 
 //Configuration & Constants
 
@@ -82,7 +82,11 @@ const char* TOPIC_WEATHER_HUM = "zonio/weather/DP/humidity";
 const char* TOPIC_WEATHER_PRES = "zonio/weather/DP/pressure";
 const char* TOPIC_WEATHER_LUX = "zonio/weather/DP/light";
 
-const char* FIRMWARE_VERSION = "v2.3.0-ESP8266-GPT-AR";
+const char* FIRMWARE_VERSION = "v2.4.1-ESP8266-GPT-AR-XOR";
+
+// ===== XOR ENCRYPTION KEY =====
+// Key is used for E2E payload obfuscation - MUST MATCH BACKEND!
+static const char* XOR_KEY = "MojeTajneHeslo1234567890";
 
 // ===== VZORKOVACÍ INTERVALY =====
 // Časování v ms - optimalizované pro ESP8266
@@ -163,7 +167,7 @@ enum OperationalMode {
 
 // ===== DEVICE INFORMATION =====
 const char* DEVICE_TYPE = "ESP8266_D1_MINI";
-const char* DEVICE_LOCATION = "DataPoint1";
+const char* DEVICE_LOCATION = "DataPoint";
 
 // ===== BUFFER SIZES (pro char buffery místo String) =====
 #define JSON_BUFFER_SIZE 256      // MQTT JSON payloads
@@ -724,45 +728,24 @@ const char* getOperationalModeString(OperationalMode mode) {
 void emergencyRestart(const char* reason);
 void publishOnlineStatus(); // Forward decl due to usage in connectMQTT
 
+// XOR encrypt/decrypt payload IN-PLACE (symmetric operation)
+// Works directly on buffer to avoid RAM fragmentation
+void xorPayload(char* buffer, int len) {
+  int keyLen = strlen(XOR_KEY);
+  for (int i = 0; i < len; i++) {
+    buffer[i] = buffer[i] ^ XOR_KEY[i % keyLen];
+  }
+}
+
 // ===== WIFI PŘIPOJENÍ =====
 void connectWiFi() {
-  Serial.println("WiFi připojování...");
-  digitalWrite(LED_BUILTIN, LOW); // LED on
+  Serial.println("WiFi: Zahajuji asynchronni pripojovani...");
+  // LED on (inverted logic on D1 Mini)
+  digitalWrite(LED_BUILTIN, LOW); 
   
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  
-  unsigned long startAttempt = millis();
-  int attempts = 0;
-  
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_TIMEOUT) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-    
-    // Blink LED během připojování
-    digitalWrite(LED_BUILTIN, attempts % 2);
-    
-    if (attempts > 40) { // 20 sekund timeout
-      break;
-    }
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnected = true;
-    Serial.println("\nWiFi připojeno!");
-    Serial.print("IP adresa: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("RSSI: ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
-    
-    digitalWrite(LED_BUILTIN, HIGH); // LED off
-  } else {
-    wifiConnected = false;
-    Serial.println("\nWiFi připojení selhalo!");
-    digitalWrite(LED_BUILTIN, HIGH); // LED off
-  }
+  // Neblokujeme - kontrola probiha v checkConnections
 }
 
 // ===== MQTT PŘIPOJENÍ =====
@@ -845,21 +828,24 @@ void publishWeatherData() {
   digitalWrite(LED_BUILTIN, LOW); // LED on během publikace
   
   // Char buffer místo String concatenation - efektivnější!
-  snprintf(g_jsonBuffer, sizeof(g_jsonBuffer),
+  int payloadLen = snprintf(g_jsonBuffer, sizeof(g_jsonBuffer),
            "{\"%s\":%.1f,\"%s\":%.1f,\"%s\":%d,\"%s\":%.1f}",
            KEY_TEMP, currentSensorData.temperature,
            KEY_HUM, currentSensorData.humidity,
            KEY_PRES, (int)currentSensorData.pressure,
            KEY_LUX, currentSensorData.lux);
+
+  // XOR encrypt IN-PLACE
+  xorPayload(g_jsonBuffer, payloadLen);
   
-  bool published = mqttClient.publish(TOPIC_WEATHER, g_jsonBuffer);
-  
+  // Publish as BINARY data
+  // Use (uint8_t*) cast and length parameter because XOR can produce 0x00 bytes
+  bool published = mqttClient.publish(TOPIC_WEATHER, (uint8_t*)g_jsonBuffer, payloadLen);
+
   if (published) {
-    Serial.println("Weather data publikována:");
+    Serial.println("Weather data publikována (XOR encrypted):");
     Serial.print("Topic: ");
     Serial.println(TOPIC_WEATHER);
-    Serial.print("Payload: ");
-    Serial.println(g_jsonBuffer);
   } else {
     Serial.println("Chyba při publikaci weather dat!");
   }
@@ -938,7 +924,16 @@ void checkConnections() {
     } else {
       if (!wifiConnected) {
         wifiConnected = true;
-        Serial.println("WiFi obnoveno");
+        
+        // Detailni vypis po pripojeni (presunuto z connectWiFi)
+        Serial.println("\nWiFi pripojeno! (Async)");
+        Serial.print("IP adresa: ");
+        Serial.println(WiFi.localIP());
+        Serial.print("RSSI: ");
+        Serial.print(WiFi.RSSI());
+        Serial.println(" dBm");
+        digitalWrite(LED_BUILTIN, HIGH); // LED off
+        
         reconnectInterval = RECONNECT_BASE; // Reset MQTT interval
       }
     }
@@ -1169,7 +1164,7 @@ void setup() {
   Serial.println("\n=== MQTT KONFIGURACE ===");
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   mqttClient.setKeepAlive(60);
-  mqttClient.setSocketTimeout(30);
+  // mqttClient.setSocketTimeout(30); // REMOVED - zpusobuje blokovani pri vypadku MQTT!
   
   Serial.print("MQTT server: ");
   Serial.print(MQTT_SERVER);
