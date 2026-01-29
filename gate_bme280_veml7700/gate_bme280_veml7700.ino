@@ -1,6 +1,6 @@
 // @ZONIO_ID:ZONIO-ESP8266-GATE
 // Zonio ESP8266 D1 Mini VEML7700 Light Sensor with Config Gate Integration
-// Version: 4.1.3-GATE
+// Version: 4.1.4-GATE
 // Hardware: ESP8266 D1 Mini + VEML7700
 // Config: Via Zonio Config Gate
 // XOR obfuscation
@@ -65,7 +65,7 @@
 
 
 // ===== FIRMWARE VERSION =====
-#define FW_VERSION              "v4.1.2-GATE-XOR"
+#define FW_VERSION              "v4.1.4-GATE-XOR"
 #define DEVICE_TYPE             "BME280_veml7700_combi_sensor"
 
 // ===== XOR ENCRYPTION KEY =====
@@ -92,10 +92,25 @@
 // ===== TIMING CONSTANTS (ms) =====
 #define WIFI_CONNECT_TIMEOUT    10000     // 10 seconds
 #define WIFI_CONNECT_RETRIES    20        // 20 × 500ms = 10s
-#define INT_FAST                500       // 500ms sensor read
+#define INT_FAST                1000      // 1s - Realtime mode (startup/changes)
+#define INT_NORMAL              5000      // 5s - Partial stability
+#define INT_SLOW                60000     // 60s - Full stability
 #define INT_STATUS              60000     // 60s status report
 #define RECONNECT_BASE          5000      // 5s base MQTT reconnect
 #define RECONNECT_MAX           300000    // 5min max reconnect interval
+
+// ===== HEALTH CHECK CONSTANTS =====
+#define MAX_FAILED_MQTT_RECONNECTS  50    // Max MQTT reconnect attempts
+#define MEMORY_WARNING_THRESHOLD    15000 // 15KB - warning threshold
+#define MEMORY_CRITICAL_THRESHOLD   10000 // 10KB - emergency restart
+
+// ===== STABILITY DETECTION CONSTANTS =====
+#define HISTORY_SIZE 10                   // Velikost historie pro stability detection
+const float TEMP_THRESH = 0.3;            // °C/min pro stabilitu
+const float HUM_THRESH = 1.5;             // %/min pro stabilitu
+const float PRES_THRESH = 0.5;            // hPa/min pro stabilitu
+const float LUX_THRESH = 50.0;            // lux/min pro stabilitu
+const int STABILITY_SAMPLES = 6;          // Počet vzorků pro stability detection
 
 // ===== MQTT PAYLOAD KEYS =====
 // Status keys
@@ -171,6 +186,61 @@ struct VemlRangeStep {
   const char* name;
 };
 
+// ===== OPERATIONAL MODES =====
+enum OperationalMode {
+  MODE_FAST,      // Rychlé vzorkování (1s) - realtime
+  MODE_NORMAL,    // Normální vzorkování (5s)  
+  MODE_SLOW       // Pomalé vzorkování (60s)
+};
+
+// ===== SENSOR HISTORY (for stability detection) =====
+struct SensorHistory {
+  float values[HISTORY_SIZE];
+  int index;
+  bool filled;
+  unsigned long timestamps[HISTORY_SIZE];
+
+  void init() {
+    index = 0;
+    filled = false;
+    for (int i = 0; i < HISTORY_SIZE; i++) {
+      values[i] = 0.0;
+      timestamps[i] = 0;
+    }
+  }
+
+  void add(float value, unsigned long timestamp) {
+    values[index] = value;
+    timestamps[index] = timestamp;
+    index = (index + 1) % HISTORY_SIZE;
+    if (index == 0) filled = true;
+  }
+
+  float getChangeRate(int sampleCount) {
+    if (index == 0 && !filled) return 0.0;
+    
+    int count = filled ? HISTORY_SIZE : index;
+    count = min(count, sampleCount);
+    
+    if (count < 2) return 0.0;
+    
+    int startIdx = (index - count + HISTORY_SIZE) % HISTORY_SIZE;
+    int endIdx = (index - 1 + HISTORY_SIZE) % HISTORY_SIZE;
+    
+    float valueChange = fabs(values[endIdx] - values[startIdx]);
+    unsigned long timeChange = timestamps[endIdx] - timestamps[startIdx];
+    
+    if (timeChange == 0) return 0.0;
+    
+    return valueChange * 60000.0 / timeChange; // změna za minutu
+  }
+
+  bool isStable(float maxChangePerMinute, int sampleCount) {
+    float rate = getChangeRate(sampleCount);
+    return rate <= maxChangePerMinute;
+  }
+};
+
 //------------03-----------
 
 //------------04-----------
@@ -204,6 +274,7 @@ int reconnectCount = 0;
 int wifiReconnectAttempts = 0;
 unsigned long disconnectStartTime = 0; // For 1h timeout
 bool wasEverConnected = false;         // To verify stability
+int failedMqttReconnectCount = 0;      // Track MQTT-specific failures
 
 // ===== VEML AUTORANGE STATE =====
 #if ENABLE_VEML_AUTORANGE
@@ -220,6 +291,16 @@ static unsigned long g_vemlSkipUntilMs  = 0;
 
 // ===== DEVICE INFO =====
 char chipId[16] = "";
+
+// ===== STABILITY DETECTION & ADAPTIVE SAMPLING =====
+SensorHistory tempHistory;
+SensorHistory humidityHistory;
+SensorHistory pressureHistory;
+SensorHistory luxHistory;
+OperationalMode currentMode = MODE_FAST;  // Start in realtime mode
+unsigned long currentSensorInterval = INT_FAST;
+bool stabilityDetected = false;
+unsigned long stabilityStartTime = 0;
 
 //------------04-----------
 
@@ -241,6 +322,11 @@ void setupNormalMode();
 void loopNormalMode();
 bool initSensors();
 void readSensors();
+void emergencyRestart(const char* reason);
+void checkMemoryHealth();
+void updateSensorHistories();
+void checkStability();
+void setOperationalMode(OperationalMode newMode, const char* reason);
 
 // XOR encrypt/decrypt payload IN-PLACE (symmetric operation)
 // Works directly on buffer to avoid RAM fragmentation
@@ -548,7 +634,7 @@ void handleSchema() {
   JsonObject mqtt = config["mqtt"].to<JsonObject>();
   mqtt["server"]["type"] = "text";
   mqtt["server"]["label"] = "MQTT Server";
-  mqtt["server"]["default"] = "192.168.0.9";
+  mqtt["server"]["default"] = "192.168.0.1";
   mqtt["server"]["required"] = true;
   
   mqtt["port"]["type"] = "number";
@@ -765,42 +851,48 @@ void publishWeatherData() {
 void publishSystemStatus() {
   if (!mqttClient.connected()) return;
   
-  char msg[512];
   IPAddress ip = WiFi.localIP();
   uint32_t freeHeap = ESP.getFreeHeap();
-  uint32_t flashSize = ESP.getFlashChipSize();
+  char msg[150];  // Max 150 bytes per payload
+  String baseSystemTopic = "zonio/system/" + String(chipId);
   
+  // Topic 1: Network Info (~100 bytes)
   snprintf(msg, sizeof(msg),
-           "{\"%s\":\"%d.%d.%d.%d\",\"%s\":\"%s\",\"%s\":%lu,\"%s\":%d,\"%s\":%d,"
-           "\"%s\":%lu,\"%s\":%lu,\"%s\":%s,\"%s\":%s,\"%s\":\"%s\",\"%s\":%lu",
-           KEY_DEVICE_IP, ip[0], ip[1], ip[2], ip[3],
-           KEY_FW_VER, FW_VERSION,
-           KEY_UPTIME, uptimeSeconds,
-           KEY_RSSI_SYS, WiFi.RSSI(),
-           KEY_RECONNECT, reconnectCount,
-           KEY_FREE_HEAP, freeHeap,
-           KEY_SAMPLE_INT, (INT_FAST / 1000),
-           KEY_BME280, (currentSensorData.bme280Working ? "true" : "false"),
-           KEY_VEML7700, (currentSensorData.vemlWorking ? "true" : "false"),
-           KEY_CHIP_ID, chipId,
-           KEY_FLASH_SIZE, flashSize);
+           "{\"ip\":\"%d.%d.%d.%d\",\"rssi\":%d,\"reconnects\":%d}",
+           ip[0], ip[1], ip[2], ip[3],
+           WiFi.RSSI(),
+           reconnectCount);
+  mqttClient.publish((baseSystemTopic + "/network").c_str(), msg);
   
-  // Add VEML autorange info
-  int len = strlen(msg);
-  snprintf(msg + len, sizeof(msg) - len,
-           ",\"veml_autorange_enabled\":%s",
+  // Topic 2: Device Info (~120 bytes)
+  snprintf(msg, sizeof(msg),
+           "{\"fw\":\"%s\",\"uptime\":%lu,\"heap\":%lu,\"chipId\":\"%s\"}",
+           FW_VERSION,
+           uptimeSeconds,
+           freeHeap,
+           chipId);
+  mqttClient.publish((baseSystemTopic + "/device").c_str(), msg);
+  
+  // Topic 3: Sensor Status (~140 bytes)
+  snprintf(msg, sizeof(msg),
+           "{\"bme280\":%s,\"veml7700\":%s,\"veml_ar\":%s",
+           currentSensorData.bme280Working ? "true" : "false",
+           currentSensorData.vemlWorking ? "true" : "false",
            deviceConfig.veml_autorange ? "true" : "false");
   
+  // Add VEML range info if autorange active
   if (deviceConfig.veml_autorange) {
-    len = strlen(msg);
+    int len = strlen(msg);
     snprintf(msg + len, sizeof(msg) - len,
-             ",\"veml_step\":%d,\"veml_range\":\"%s\"",
-             VEML_GetCurrentStepIndex(), VEML_GetCurrentStepName());
+             ",\"veml_step\":%d,\"veml_range\":\"%s\"}",
+             VEML_GetCurrentStepIndex(), 
+             VEML_GetCurrentStepName());
+  } else {
+    strcat(msg, "}");
   }
+  mqttClient.publish((baseSystemTopic + "/sensors").c_str(), msg);
   
-  strcat(msg, "}");
-  String systemTopic = "zonio/system/" + String(chipId);
-  mqttClient.publish(systemTopic.c_str(), msg);
+  Serial.println("[MQTT] System status published (3 topics)");
 }
 
 void setupNormalMode() {
@@ -831,6 +923,13 @@ void setupNormalMode() {
     // We do NOT switch to Gate Mode here anymore. 
     // The loopNormalMode will handle the "Scan Gate -> If not found -> Retry WiFi" logic.
   }
+  
+  // Initialize sensor histories for stability detection
+  tempHistory.init();
+  humidityHistory.init();
+  pressureHistory.init();
+  luxHistory.init();
+  Serial.println("[STABILITY] History buffers initialized");
   
   mqttClient.setServer(deviceConfig.mqtt_server, deviceConfig.mqtt_port);
   mqttClient.setKeepAlive(60);
@@ -925,6 +1024,7 @@ void loopNormalMode() {
     if (now - lastMQTTReconnectAttempt > mqttReconnectInterval) {
       lastMQTTReconnectAttempt = now;
       reconnectCount++;
+      failedMqttReconnectCount++;  // Track failures
       
       Serial.print("[MQTT] Connecting (attempt ");
       Serial.print(reconnectCount);
@@ -937,11 +1037,17 @@ void loopNormalMode() {
                              deviceConfig.mqtt_pass)) {
         Serial.println(" OK");
         mqttReconnectInterval = RECONNECT_BASE;  // Reset interval
+        failedMqttReconnectCount = 0;  // Reset fail counter
         publishOnlineStatus();
         publishSystemStatus();
       } else {
         Serial.print(" FAIL rc=");
         Serial.println(mqttClient.state());
+        
+        // Check if exceeded MAX_FAILED_MQTT_RECONNECTS
+        if (failedMqttReconnectCount > MAX_FAILED_MQTT_RECONNECTS) {
+          emergencyRestart("Příliš mnoho neúspěšných MQTT pokusů");
+        }
         
         // Exponential backoff
         mqttReconnectInterval *= 2;
@@ -955,15 +1061,24 @@ void loopNormalMode() {
     }
   } else {
     mqttClient.loop();
+    failedMqttReconnectCount = 0;  // Reset on active connection
   }
   
   // ==========================================================
   // 4. SENSOR READING & PUBLISHING (WiFi connected)
   // ==========================================================
-  // Sensor reading
-  if (now - lastSensorRead >= INT_FAST) {
+  // Sensor reading with adaptive interval based on stability
+  if (now - lastSensorRead >= currentSensorInterval) {
     lastSensorRead = now;
     readSensors();
+    
+    // Update sensor histories for stability detection
+    updateSensorHistories();
+    
+    // Check stability and adjust mode if needed
+    checkStability();
+    
+    // Always publish when reading (frequency determined by currentSensorInterval)
     if (mqttClient.connected()) {
       publishWeatherData();
     }
@@ -991,6 +1106,130 @@ void loopNormalMode() {
 }
 
 //------------09-----------
+
+// UPDATE SENSOR HISTORIES - Add current readings to history buffers
+void updateSensorHistories() {
+  unsigned long now = millis();
+  tempHistory.add(currentSensorData.temperature, now);
+  humidityHistory.add(currentSensorData.humidity, now);
+  pressureHistory.add(currentSensorData.pressure, now);
+  luxHistory.add(currentSensorData.lux, now);
+}
+
+// CHECK STABILITY - Determine if environment is stable
+void checkStability() {
+  // Check stability of all sensors
+  bool isTempStable = tempHistory.isStable(TEMP_THRESH, STABILITY_SAMPLES);
+  bool isHumStable = humidityHistory.isStable(HUM_THRESH, STABILITY_SAMPLES);
+  bool isPresStable = pressureHistory.isStable(PRES_THRESH, STABILITY_SAMPLES);
+  bool isLuxStable = luxHistory.isStable(LUX_THRESH, STABILITY_SAMPLES);
+  
+  // All sensors must be stable
+  bool isCurrentlyStable = isTempStable && isHumStable && isPresStable && isLuxStable;
+  
+  // Detect stability change
+  if (isCurrentlyStable && !stabilityDetected) {
+    stabilityDetected = true;
+    stabilityStartTime = millis();
+    Serial.println("[STABILITY] Detected - switching to slower mode");
+    
+    // Switch to slower mode
+    if (currentMode == MODE_FAST) {
+      setOperationalMode(MODE_NORMAL, "Stabilita detekována");
+    }
+  } else if (!isCurrentlyStable && stabilityDetected) {
+    stabilityDetected = false;
+    Serial.println("[STABILITY] Lost - switching to faster mode");
+    
+    // Switch to faster mode
+    setOperationalMode(MODE_FAST, "Ztráta stability");
+  }
+}
+
+// SET OPERATIONAL MODE - Change sampling interval
+void setOperationalMode(OperationalMode newMode, const char* reason) {
+  if (newMode == currentMode) return;
+  
+  OperationalMode oldMode = currentMode;
+  currentMode = newMode;
+  
+  // Update sensor interval
+  switch (currentMode) {
+    case MODE_FAST:
+      currentSensorInterval = INT_FAST;   // 1s - Realtime
+      break;
+    case MODE_NORMAL:
+      currentSensorInterval = INT_NORMAL; // 5s
+      break;
+    case MODE_SLOW:
+      currentSensorInterval = INT_SLOW;   // 60s
+      break;
+  }
+  
+  // Log change
+  Serial.print("[MODE] ");
+  switch (oldMode) {
+    case MODE_FAST: Serial.print("FAST"); break;
+    case MODE_NORMAL: Serial.print("NORMAL"); break;
+    case MODE_SLOW: Serial.print("SLOW"); break;
+  }
+  Serial.print(" -> ");
+  switch (currentMode) {
+    case MODE_FAST: Serial.print("FAST"); break;
+    case MODE_NORMAL: Serial.print("NORMAL"); break;
+    case MODE_SLOW: Serial.print("SLOW"); break;
+  }
+  Serial.print(" (");
+  Serial.print(currentSensorInterval);
+  Serial.print("ms) - ");
+  Serial.println(reason);
+}
+
+// EMERGENCY RESTART - Called when critical issues detected
+void emergencyRestart(const char* reason) {
+  Serial.println("\n╔═══════════════════════════════════════════════╗");
+  Serial.println("║        EMERGENCY RESTART                     ║");
+  Serial.println("╚═══════════════════════════════════════════════╝");
+  Serial.print("Důvod: ");
+  Serial.println(reason);
+  
+  // Publish offline status if possible
+  if (mqttClient.connected()) {
+    char msg[80];
+    snprintf(msg, sizeof(msg), "{\"status\":\"restarting\",\"reason\":\"%s\"}", reason);
+    String statusTopic = "zonio/status/" + String(chipId);
+    mqttClient.publish(statusTopic.c_str(), msg, true);
+    mqttClient.loop();
+    delay(1000);
+  }
+  
+  // LED signaling (10x fast blink)
+  for (int i = 0; i < 10; i++) {
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+  }
+  
+  ESP.restart();
+}
+
+// MEMORY HEALTH CHECK - Prevents low-memory crashes
+void checkMemoryHealth() {
+  uint32_t freeHeap = ESP.getFreeHeap();
+  
+  // Warning threshold
+  if (freeHeap < MEMORY_WARNING_THRESHOLD) {
+    Serial.print("⚠️  LOW MEMORY WARNING: ");
+    Serial.print(freeHeap);
+    Serial.println(" bytes");
+  }
+  
+  // Critical threshold - restart
+  if (freeHeap < MEMORY_CRITICAL_THRESHOLD) {
+    emergencyRestart("Low memory");
+  }
+}
 
 //------------10-----------
 // BLOCK 10: SETUP & MAIN LOOP
@@ -1057,6 +1296,25 @@ void loop() {
   if (now - lastUptimeUpdate >= 1000) {
     lastUptimeUpdate = now;
     uptimeSeconds++;
+  }
+  
+  // Memory health check (every 30s)
+  static unsigned long lastMemCheck = 0;
+  if (now - lastMemCheck >= 30000) {
+    lastMemCheck = now;
+    checkMemoryHealth();
+  }
+  
+  // Periodic status print (every 5 min)
+  static unsigned long lastStatusPrint = 0;
+  if (now - lastStatusPrint >= 300000) {
+    lastStatusPrint = now;
+    Serial.print("[STATUS] Uptime: ");
+    Serial.print(uptimeSeconds / 3600);
+    Serial.print("h, Heap: ");
+    Serial.print(ESP.getFreeHeap());
+    Serial.print("b, MQTT: ");
+    Serial.println(mqttClient.connected() ? "OK" : "DOWN");
   }
   
   // Run mode-specific loop
